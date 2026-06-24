@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Document to Google Sheet</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 700px; margin: 30px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 22px; }
+  .step { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .step h3 { margin-top: 0; }
+  button { background: #1a73e8; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #1558b0; }
+  button.secondary { background: #555; }
+  input[type="text"] { padding: 6px; border: 1px solid #ccc; border-radius: 4px; width: 45%; }
+  textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+  #status { font-size: 13px; color: #555; margin-top: 8px; }
+  #preview { max-width: 250px; display: none; margin-top: 10px; border: 1px solid #ddd; border-radius: 6px; }
+  .field-row { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Document Upload &rarr; OCR &rarr; Sheet</h1>
+
+<div class="step">
+  <h3>1. Document upload karo</h3>
+  <input type="file" id="fileInput" accept="image/*">
+  <br>
+  <img id="preview" alt="preview">
+</div>
+
+<div class="step">
+  <h3>2. OCR chalao</h3>
+  <button onclick="runOCR()">Extract karo</button>
+  <div id="status"></div>
+</div>
+
+<div class="step" id="previewStep" style="display:none">
+  <h3>3 &amp; 4. Preview &mdash; fields check / edit karo</h3>
+  <div id="fieldsContainer"></div>
+  <button class="secondary" onclick="addField()">+ Field add karo</button>
+  <h4>Raw OCR text</h4>
+  <textarea id="rawText" rows="6"></textarea>
+</div>
+
+<div class="step" id="submitStep" style="display:none">
+  <h3>5. Google Sheet mein bhejo</h3>
+  <button onclick="submitToSheet()">Sheet mein add karo</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+  // Apps Script deploy karne ke baad yahan apna Web App URL paste karo
+  const SHEET_WEBAPP_URL = "PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE";
+
+  const fileInput = document.getElementById('fileInput');
+  const preview = document.getElementById('preview');
+  const statusEl = document.getElementById('status');
+  const fieldsContainer = document.getElementById('fieldsContainer');
+  let fieldCount = 0;
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (file) {
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = 'block';
+    }
+  });
+
+  async function runOCR() {
+    const file = fileInput.files[0];
+    if (!file) { alert('Pehle ek file select karo'); return; }
+
+    statusEl.textContent = 'OCR shuru ho raha hai...';
+    const result = await Tesseract.recognize(file, 'eng', {
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          statusEl.textContent = 'OCR chal raha hai: ' + Math.round(m.progress * 100) + '%';
+        }
+      }
+    });
+
+    const text = result.data.text;
+    statusEl.textContent = 'OCR poora hua.';
+    showPreview(text);
+  }
+
+  function extractFields(text) {
+    // Simple "Key: Value" ya "Key - Value" pattern dhoondta hai, line by line
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const fields = [];
+    lines.forEach(line => {
+      const match = line.match(/^([A-Za-z0-9 .#]{2,30})[:\-]\s*(.+)$/);
+      if (match) {
+        fields.push({ key: match[1].trim(), value: match[2].trim() });
+      }
+    });
+    return fields;
+  }
+
+  function showPreview(text) {
+    document.getElementById('previewStep').style.display = 'block';
+    document.getElementById('submitStep').style.display = 'block';
+    document.getElementById('rawText').value = text;
+
+    fieldsContainer.innerHTML = '';
+    fieldCount = 0;
+
+    const fields = extractFields(text);
+    if (fields.length === 0) {
+      fieldsContainer.innerHTML = '<p>Koi key:value pattern auto-detect nahi hua. Neeche manually field add karo, ya raw text se copy-paste karo.</p>';
+    } else {
+      fields.forEach(f => addField(f.key, f.value));
+    }
+  }
+
+  function addField(key = '', value = '') {
+    const i = fieldCount++;
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    row.innerHTML = `<input type="text" placeholder="Field name" id="key${i}" value="${key.replace(/"/g, '&quot;')}"> : <input type="text" placeholder="Value" id="val${i}" value="${value.replace(/"/g, '&quot;')}">`;
+    fieldsContainer.appendChild(row);
+  }
+
+  async function submitToSheet() {
+    if (SHEET_WEBAPP_URL.includes('PASTE_')) {
+      alert('Pehle index.html mein apna Apps Script Web App URL daalo (SHEET_WEBAPP_URL).');
+      return;
+    }
+
+    const data = {};
+    for (let i = 0; i < fieldCount; i++) {
+      const k = document.getElementById('key' + i);
+      const v = document.getElementById('val' + i);
+      if (k && v && k.value.trim()) data[k.value.trim()] = v.value;
+    }
+
+    if (Object.keys(data).length === 0) {
+      alert('Koi field nahi bhara. Pehle fields add/edit karo.');
+      return;
+    }
+
+    statusEl.textContent = 'Sheet mein bhej rahe hain...';
+    try {
+      await fetch(SHEET_WEBAPP_URL, {
+        method: 'POST',
+        body: JSON.stringify(data),
+        headers: { 'Content-Type': 'text/plain' }
+      });
+      statusEl.textContent = 'Done! Google Sheet mein row add ho gaya.';
+    } catch (err) {
+      statusEl.textContent = 'Error: ' + err.message;
+    }
+  }
+</script>
+
+</body>
+</html>
