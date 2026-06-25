@@ -32,6 +32,9 @@
 
 <div class="step">
   <h3>2. OCR chalao</h3>
+  <label style="font-size:13px; display:block; margin-bottom:4px;">Google Vision API Key (behtar accuracy ke liye, optional):</label>
+  <input type="text" id="visionApiKey" placeholder="Yahan API key paste karo" style="width:100%; box-sizing:border-box; margin-bottom:8px;">
+  <div style="font-size:12px; color:#777; margin-bottom:10px;">Khaali rakho toh free Tesseract (browser OCR) use hoga. Key dalo toh Google Vision use hoga (zyada accurate).</div>
   <button onclick="runOCR()">Extract karo</button>
   <div id="status"></div>
 </div>
@@ -88,7 +91,7 @@
           // Grayscale
           const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
           // Contrast boost (simple linear stretch around mid-point)
-          let contrasted = (gray - 128) * 1.6 + 128;
+          let contrasted = (gray - 128) * 1.25 + 128;
           contrasted = Math.max(0, Math.min(255, contrasted));
           d[i] = d[i + 1] = d[i + 2] = contrasted;
         }
@@ -100,18 +103,67 @@
     });
   }
 
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Google Vision API se OCR - zyada accurate, khaaskar glare/angle/laminated cards pe
+  async function googleVisionOCR(file, apiKey) {
+    const base64 = await fileToBase64(file);
+    const response = await fetch(
+      'https://vision.googleapis.com/v1/images:annotate?key=' + apiKey,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requests: [{
+            image: { content: base64 },
+            features: [{ type: 'TEXT_DETECTION' }],
+            imageContext: { languageHints: ['en', 'hi'] }
+          }]
+        })
+      }
+    );
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    const resp = data.responses && data.responses[0];
+    if (!resp || !resp.fullTextAnnotation) throw new Error('Vision API se text nahi mila (shayad image mein text detect nahi hua)');
+    return resp.fullTextAnnotation.text;
+  }
+
   async function runOCR() {
     const file = fileInput.files[0];
     if (!file) { alert('Pehle ek file select karo'); return; }
+    const apiKey = document.getElementById('visionApiKey').value.trim();
 
+    if (apiKey) {
+      statusEl.textContent = 'Google Vision OCR chal raha hai...';
+      try {
+        const text = await googleVisionOCR(file, apiKey);
+        statusEl.textContent = 'Google Vision OCR poora hua.';
+        showPreview(text);
+      } catch (err) {
+        statusEl.textContent = 'Google Vision error: ' + err.message;
+      }
+      return;
+    }
+
+    // API key nahi hai -> free Tesseract OCR use karo
     statusEl.textContent = 'Image process ho rahi hai...';
     const processedBlob = await preprocessImage(file);
 
-    statusEl.textContent = 'OCR shuru ho raha hai...';
-    const result = await Tesseract.recognize(processedBlob, 'eng', {
+    statusEl.textContent = 'OCR shuru ho raha hai (eng+hin model load ho raha hai, pehli baar thoda time lagega)...';
+    const result = await Tesseract.recognize(processedBlob, 'eng+hin', {
       logger: m => {
         if (m.status === 'recognizing text') {
           statusEl.textContent = 'OCR chal raha hai: ' + Math.round(m.progress * 100) + '%';
+        } else if (m.status) {
+          statusEl.textContent = m.status + '...';
         }
       }
     });
@@ -134,23 +186,51 @@
     return fields;
   }
 
-  // Common ID-card patterns dhoondta hai (PAN number, DOB, naam)
+  // Common ID-card patterns dhoondta hai (PAN/Aadhaar number, DOB, gender, naam)
   // Useful jab OCR text bahut messy ho aur "key:value" detect na ho
   function extractKnownPatterns(text) {
     const fields = [];
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const labelWords = /government|india|aadhaar|unique|identification|authority|identity|citizenship|verification|online|offline|scanning|proof|signature|address|details|issued|card|department|permanent|account|number/i;
 
     const pan = text.match(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/);
     if (pan) fields.push({ key: 'PAN Number', value: pan[0] });
 
-    const dob = text.match(/\b\d{2}\/\d{2}\/\d{4}\b/);
-    if (dob) fields.push({ key: 'Date of Birth', value: dob[0] });
+    // Aadhaar number: 12 digits, spaces optional (OCR kabhi spaces drop kar deta hai)
+    const aadhaar = text.match(/\b\d{4}\s?\d{4}\s?\d{4}\b/);
+    if (aadhaar) fields.push({ key: 'Aadhaar Number', value: aadhaar[0].replace(/\s+/g, ' ') });
 
-    // "Name" wali line ke theek baad jo all-caps line hai, wo naam ho sakta hai
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    // DOB - pehle "DOB" label ke saath dhoondo, warna koi bhi date pattern
+    const dobLabelled = text.match(/DOB[:\s]*([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})/i);
+    if (dobLabelled) {
+      fields.push({ key: 'Date of Birth', value: dobLabelled[1] });
+    } else {
+      const dob = text.match(/\b\d{1,2}\/\d{1,2}\/\d{4}\b/);
+      if (dob) fields.push({ key: 'Date of Birth', value: dob[0] });
+    }
+
+    const gender = text.match(/\bFEMALE\b|\bMALE\b/i);
+    if (gender) fields.push({ key: 'Gender', value: gender[0].toUpperCase() });
+
+    // Naam: jab Devanagari-only line ke theek baad ek English/Latin line aaye
+    // (Aadhaar card layout: Hindi naam line, phir English naam line)
+    for (let i = 0; i < lines.length - 1; i++) {
+      const hasDevanagari = /[\u0900-\u097F]/.test(lines[i]);
+      const noLatinWords = !/[A-Za-z]{2,}/.test(lines[i]);
+      if (hasDevanagari && noLatinWords) {
+        const next = lines[i + 1];
+        if (next && /^[A-Za-z][A-Za-z .]{2,40}$/.test(next) && !labelWords.test(next)) {
+          fields.push({ key: 'Name', value: next });
+          break;
+        }
+      }
+    }
+
+    // Naam: PAN card layout - "Name" label ke baad ALL-CAPS line
     for (let i = 0; i < lines.length; i++) {
       if (/name/i.test(lines[i]) && !/father/i.test(lines[i])) {
         const next = lines[i + 1];
-        if (next && /^[A-Z][A-Z .]{2,40}$/.test(next)) {
+        if (next && /^[A-Z][A-Z .]{2,40}$/.test(next) && !labelWords.test(next)) {
           fields.push({ key: 'Name', value: next });
         }
       }
